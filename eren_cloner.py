@@ -4,7 +4,11 @@ from pyrogram.types import (
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 )
 import time
+import os
+from dotenv import load_dotenv
 from tqdm import tqdm
+
+load_dotenv()
 
 api_id = int(os.environ["API_ID"])
 api_hash = os.environ["API_HASH"]
