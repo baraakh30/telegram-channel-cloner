@@ -1,65 +1,95 @@
 from pyrogram import Client
 from pyrogram.errors import FloodWait
+from pyrogram.types import (
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+)
 import time
 from tqdm import tqdm
 
-# Add your credentials here
 api_id = int(os.environ["API_ID"])
 api_hash = os.environ["API_HASH"]
 phone_number = os.environ["PHONE_NUMBER"]
 
-# Source and destination channel usernames (private channels)
 source_channel = int(os.environ["SOURCE_CHANNEL"])
 destination_channel = int(os.environ["DESTINATION_CHANNEL"])
 
-# Initialize the client
 eren = Client("user_session", api_id, api_hash, phone_number=phone_number)
+
+
+def build_input_media(message):
+    """Convert a message to an InputMedia object for use in send_media_group."""
+    caption = message.caption or ""
+    entities = message.caption_entities
+
+    if message.photo:
+        return InputMediaPhoto(message.photo.file_id, caption=caption, caption_entities=entities)
+    elif message.video:
+        return InputMediaVideo(message.video.file_id, caption=caption, caption_entities=entities)
+    elif message.document:
+        return InputMediaDocument(message.document.file_id, caption=caption, caption_entities=entities)
+    elif message.audio:
+        return InputMediaAudio(message.audio.file_id, caption=caption, caption_entities=entities)
+    return None
+
+
+def send_with_retry(func, *args, **kwargs):
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except FloodWait as e:
+            print(f"\nRate limited. Waiting {e.value} seconds...")
+            time.sleep(e.value)
+        except Exception as e:
+            print(f"\nFailed: {e}")
+            return None
+
 
 def forward_old_messages():
     with eren:
-        messages = []
+        print("Fetching messages from source channel...")
+        messages = list(eren.get_chat_history(source_channel, limit=None))
+        messages.reverse()  # oldest first
 
-        # Get all messages from the source channel in chronological order
-        for message in eren.get_chat_history(source_channel, limit=None):
-            messages.append(message)
+        total = len(messages)
+        print(f"Total messages: {total}")
 
-        # Total number of messages to forward
-        total_messages = len(messages)
-        print(f"Total messages to forward: {total_messages}")
+        # Group messages by media_group_id, preserving order
+        grouped = []  # list of (media_group_id or None, [messages])
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.media_group_id:
+                # Collect all messages in this album
+                group = [msg]
+                j = i + 1
+                while j < len(messages) and messages[j].media_group_id == msg.media_group_id:
+                    group.append(messages[j])
+                    j += 1
+                grouped.append((msg.media_group_id, group))
+                i = j
+            else:
+                grouped.append((None, [msg]))
+                i += 1
 
-        # Reverse the messages to forward from oldest to newest
-        messages.reverse()
+        with tqdm(total=total, desc="Cloning", unit="msg") as pbar:
+            for group_id, group_msgs in grouped:
+                if group_id:
+                    # Send as a media group (album)
+                    media_list = [build_input_media(m) for m in group_msgs]
+                    media_list = [m for m in media_list if m is not None]
+                    if media_list:
+                        send_with_retry(eren.send_media_group, destination_channel, media_list)
+                    pbar.update(len(group_msgs))
+                else:
+                    msg = group_msgs[0]
+                    # copy_message preserves formatting, caption entities, stickers,
+                    # animations, voice, audio, polls — everything — without "forwarded from" header
+                    send_with_retry(eren.copy_message, destination_channel, source_channel, msg.id)
+                    pbar.update(1)
 
-        # Create a progress bar
-        with tqdm(total=total_messages, desc="Forwarding Messages", unit="msg") as pbar:
-            # Iterate over the messages in batches of 100
-            for i in range(0, total_messages, 100):
-                batch = messages[i:i + 100]  # Get the next batch of 100 messages
+                time.sleep(0.5)  # small delay between sends to avoid flood
 
-                # Forward messages in the correct order (oldest to newest)
-                for message in batch:
-                    try:
-                        # Check the type of message and forward accordingly
-                        if message.text:  # If it's a text message
-                            eren.send_message(destination_channel, message.text, reply_to_message_id=message.id)
-                        elif message.photo:  # If it's a photo
-                            eren.send_photo(destination_channel, message.photo.file_id, caption=message.caption)
-                        elif message.video:  # If it's a video
-                            eren.send_video(destination_channel, message.video.file_id, caption=message.caption)
-                        elif message.document:  # If it's a document
-                            eren.send_document(destination_channel, message.document.file_id, caption=message.caption)
 
-                        pbar.update(1)  # Update the progress bar
-                    except FloodWait as e:
-                        print(f"Rate limited. Waiting for {e.x} seconds.")
-                        time.sleep(e.x)  # Wait for the specified duration
-                    except Exception as e:
-                        print(f"Failed to forward message: {e}")
-
-                # Sleep for 30 seconds after forwarding a batch
-                time.sleep(30)
-
-# Start the bot
 if __name__ == "__main__":
     forward_old_messages()
 
