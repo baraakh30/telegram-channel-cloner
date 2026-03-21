@@ -4,13 +4,13 @@ import time
 from tqdm import tqdm
 
 # Add your credentials here
-api_id =   # Replace with your actual API ID
-api_hash = ''  # Replace with your actual API Hash
-phone_number = ''  # Your phone number linked to the Telegram account
+api_id = int(os.environ["API_ID"])
+api_hash = os.environ["API_HASH"]
+phone_number = os.environ["PHONE_NUMBER"]
 
 # Source and destination channel usernames (private channels)
-source_channel = ''  # Replace with your source private channel or public channel username with @
-destination_channel = ''  # Replace with your destination private channel or public channel username with @
+source_channel = int(os.environ["SOURCE_CHANNEL"])
+destination_channel = int(os.environ["DESTINATION_CHANNEL"])
 
 # Initialize the client
 eren = Client("user_session", api_id, api_hash, phone_number=phone_number)
@@ -35,7 +35,7 @@ def forward_old_messages():
             # Iterate over the messages in batches of 100
             for i in range(0, total_messages, 100):
                 batch = messages[i:i + 100]  # Get the next batch of 100 messages
-                
+
                 # Forward messages in the correct order (oldest to newest)
                 for message in batch:
                     try:
