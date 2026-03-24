@@ -21,23 +21,8 @@ PROGRESS_FILE = "progress.txt"      # stores last successfully cloned message ID
 INDEX_CACHE_FILE = "msg_index.json"  # cached list of (id, media_group_id) from source
 SKIPPED_FILE = "skipped.json"        # all failed messages with error details
 
-# Each account needs its own session file and phone number.
-# Only Account 1 needs access to the source channel.
-# Both accounts must be admins of the destination channel.
-accounts = [
-    {
-        "client": Client("session_1", api_id, api_hash, phone_number=os.environ["PHONE_NUMBER_1"]),
-        "flood_until": 0,           # epoch time when sending is free again
-        "download_flood_until": 0,  # epoch time when downloading (auth.ExportAuthorization) is free again
-        "name": "Account 1",
-    },
-    {
-        "client": Client("session_2", api_id, api_hash, phone_number=os.environ["PHONE_NUMBER_2"]),
-        "flood_until": 0,
-        "download_flood_until": 0,
-        "name": "Account 2",
-    },
-]
+client = Client("session_1", api_id, api_hash, phone_number=os.environ["PHONE_NUMBER_1"])
+flood_until = 0  # epoch time when sending is free again
 
 
 def load_progress():
@@ -97,64 +82,25 @@ def save_skipped(msg_ids, group_id, error):
     open(SKIPPED_FILE, "w").write(json.dumps(records, indent=2))
 
 
-def get_account():
-    """Return the account with the soonest available time, sleeping if both are limited."""
-    now = time.time()
-    free = [a for a in accounts if a["flood_until"] <= now]
-    if free:
-        return free[0]
-    soonest = min(accounts, key=lambda a: a["flood_until"])
-    wait = soonest["flood_until"] - now
-    print(f"\n  Both accounts rate limited. Waiting {wait:.0f}s for {soonest['name']}...")
-    time.sleep(wait)
-    return soonest
-
-
-def send_with_retry(reader, fast_fn, slow_fn=None, _attempts=3):
+def send_with_retry(send_fn, _attempts=3):
     """
-    Send using whichever account is available, rotating on FloodWait.
-    - If Account 1 (reader) is free: fast_fn(client) — uses file_id directly.
-    - If only Account 2 is free: slow_fn(client) — downloads via reader first.
-    - slow_fn=None means the same fn works for any account (e.g. text messages).
-    - Non-FloodWait errors are retried up to _attempts times before skipping.
-    - FloodWait from inside the slow path (e.g. auth.ExportAuthorization) is
-      handled by marking Account 1 and retrying without consuming an attempt.
+    Call send_fn(client), retrying on FloodWait (sleep and retry, no attempt consumed)
+    and on other errors up to _attempts times before returning the exception.
     """
-    reader_acc = next(a for a in accounts if a["client"] is reader)
+    global flood_until
     last_exc = None
     remaining = _attempts
     while remaining > 0:
-        acc = get_account()
-        on_slow_path = slow_fn is not None and acc["client"] is not reader
-
-        if on_slow_path:
-            # Slow path downloads via reader — if reader's download is still
-            # rate-limited (auth.ExportAuthorization), wait it out first.
-            # Note: reader's send flood_until is tracked separately so a recovered
-            # send limit can still use the fast path independently.
-            wait = reader_acc["download_flood_until"] - time.time()
-            if wait > 0:
-                print(f"\n  {reader_acc['name']} download still limited ({wait:.0f}s), waiting...")
-                time.sleep(wait)
-
+        now = time.time()
+        if flood_until > now:
+            wait = flood_until - now
+            print(f"\n  Rate limited, waiting {wait:.0f}s...")
+            time.sleep(wait)
         try:
-            if not on_slow_path:
-                return fast_fn(acc["client"])
-            else:
-                return slow_fn(acc["client"])
+            return send_fn(client)
         except FloodWait as e:
-            if on_slow_path:
-                # FloodWait came from reader's download (e.g. auth.ExportAuthorization).
-                # Track separately so the send flood_until stays accurate — if the
-                # original send limit expires first, get_account() can return Account 1
-                # for a fast-path retry without waiting for the download limit too.
-                reader_acc["download_flood_until"] = time.time() + e.value
-                print(f"\n  {reader_acc['name']} rate limited for {e.value}s (download) — will retry after wait")
-            else:
-                acc["flood_until"] = time.time() + e.value
-                other = next((a for a in accounts if a is not acc), None)
-                status = f"switching to {other['name']}" if other and other["flood_until"] <= time.time() else f"waiting {e.value}s"
-                print(f"\n  {acc['name']} rate limited for {e.value}s — {status}")
+            flood_until = time.time() + e.value
+            print(f"\n  Rate limited for {e.value}s — waiting")
             # FloodWait never consumes an attempt
         except Exception as e:
             last_exc = e
@@ -227,13 +173,9 @@ def _make_single_sender(media_type, src, caption, caption_entities,
         return lambda c: c.send_message(destination_channel, caption, entities=caption_entities)
 
 
-def send_single(reader, msg_id):
-    """
-    Fetch message from Account 1 (reader), then send its content to destination
-    via whichever account is free. This way Account 2 never needs source access.
-    Account 1 sends using file_id (fast). Account 2 downloads via reader first (no MEDIA_EMPTY).
-    """
-    msg = reader.get_messages(source_channel, msg_id)
+def send_single(msg_id):
+    """Fetch message and send its content to the destination channel using file_id."""
+    msg = client.get_messages(source_channel, msg_id)
     media_type, file_id = _extract_media(msg)
     caption = msg.caption or msg.text or ""
     caption_entities = msg.caption_entities or msg.entities or None
@@ -247,25 +189,7 @@ def send_single(reader, msg_id):
             supports_streaming=msg.video.supports_streaming,
         )
 
-    fast = _make_single_sender(media_type, file_id, caption, caption_entities, **video_kwargs)
-
-    if not media_type:
-        # Text-only: same fn works for any account
-        return send_with_retry(reader, fast)
-
-    def slow(c):
-        data = reader.download_media(file_id, in_memory=True)
-        data.seek(0)
-        data.name = _media_filename(msg)
-        slow_vkw = dict(video_kwargs)
-        if media_type == "video" and msg.video and msg.video.thumbs:
-            td = reader.download_media(msg.video.thumbs[0].file_id, in_memory=True)
-            td.seek(0)
-            td.name = "thumb.jpg"
-            slow_vkw["thumb"] = td
-        return _make_single_sender(media_type, data, caption, caption_entities, **slow_vkw)(c)
-
-    return send_with_retry(reader, fast, slow)
+    return send_with_retry(_make_single_sender(media_type, file_id, caption, caption_entities, **video_kwargs))
 
 
 def _build_album_media(msgs, src_list, thumbs=None):
@@ -296,52 +220,25 @@ def _build_album_media(msgs, src_list, thumbs=None):
     return media_list
 
 
-def send_album(reader, first_msg_id):
-    """
-    Fetch a media group from Account 1 (reader), then send it as an album
-    via whichever account is free.
-    Account 1 sends using file_ids (fast). Account 2 downloads via reader first (no MEDIA_EMPTY).
-    """
-    msgs = reader.get_media_group(source_channel, first_msg_id)
+def send_album(first_msg_id):
+    """Fetch a media group and send it as an album using file_ids."""
+    msgs = client.get_media_group(source_channel, first_msg_id)
     file_ids = [_extract_media(m)[1] for m in msgs]
 
     fast_media = _build_album_media(msgs, file_ids)
     if not fast_media:
         return Exception("album had no supported media")
 
-    def slow(c):
-        sources = []
-        thumbs = []
-        for m, fid in zip(msgs, file_ids):
-            data = reader.download_media(fid, in_memory=True)
-            data.seek(0)
-            data.name = _media_filename(m)
-            sources.append(data)
-            thumb = None
-            if m.video and m.video.thumbs:
-                td = reader.download_media(m.video.thumbs[0].file_id, in_memory=True)
-                td.seek(0)
-                td.name = "thumb.jpg"
-                thumb = td
-            thumbs.append(thumb)
-        slow_media = _build_album_media(msgs, sources, thumbs)
-        if not slow_media:
-            raise Exception("album had no supported media after download")
-        return c.send_media_group(destination_channel, slow_media)
-
-    return send_with_retry(reader, lambda c: c.send_media_group(destination_channel, fast_media), slow)
+    return send_with_retry(lambda c: c.send_media_group(destination_channel, fast_media))
 
 
 def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
-    for acc in accounts:
-        acc["client"].start()
+    client.start()
 
     try:
-        reader = accounts[0]["client"]  # only Account 1 can read the source
-
         print("Finding channels...")
         source_found = dest_found = False
-        for dialog in reader.get_dialogs():
+        for dialog in client.get_dialogs():
             cid = dialog.chat.id
             if cid == source_channel:
                 print(f"  Source:      {dialog.chat.title} (ID: {cid})")
@@ -358,17 +255,6 @@ def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
         if not dest_found:
             print("Destination channel not found in your chats")
             return
-
-        # Resolve destination peer on every account so they can all send to it.
-        # Without this, accounts that haven't joined the channel via get_dialogs
-        # will get "Peer id invalid" when trying to send.
-        print("Resolving destination peer on all accounts...")
-        for acc in accounts:
-            try:
-                chat = acc["client"].get_chat(destination_channel)
-                print(f"  {acc['name']}: destination resolved ({chat.title})")
-            except Exception as e:
-                print(f"  {acc['name']}: WARNING — could not resolve destination: {e}")
 
         # Resume logic
         resume_after_id = None
@@ -394,7 +280,7 @@ def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
         else:
             print("Fetching message index from Telegram...")
             msg_index = []
-            for msg in reader.get_chat_history(source_channel):
+            for msg in client.get_chat_history(source_channel):
                 if msg.service:
                     continue
                 msg_index.append((msg.id, msg.media_group_id))
@@ -447,7 +333,7 @@ def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
         with tqdm(total=total, initial=skipped_msgs, desc="Cloning", unit="msg") as pbar:
             for group_id, msg_ids in grouped[start_index:]:
                 if group_id:
-                    result = send_album(reader, msg_ids[0])
+                    result = send_album(msg_ids[0])
                     if isinstance(result, Exception):
                         print(f"\n  [skip] album {group_id}: {result}")
                         save_skipped(msg_ids, group_id, result)
@@ -455,7 +341,7 @@ def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
                         save_progress(max(msg_ids))
                     pbar.update(len(msg_ids))
                 else:
-                    result = send_single(reader, msg_ids[0])
+                    result = send_single(msg_ids[0])
                     if isinstance(result, Exception):
                         print(f"\n  [skip] msg {msg_ids[0]}: {result}")
                         save_skipped(msg_ids, None, result)
@@ -469,8 +355,7 @@ def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
         print("Done! All messages cloned.")
 
     finally:
-        for acc in accounts:
-            acc["client"].stop()
+        client.stop()
 
 
 if __name__ == "__main__":
