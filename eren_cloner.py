@@ -66,16 +66,20 @@ def get_account():
     return soonest
 
 
-def send_with_retry(fn):
+def send_with_retry(reader, fast_fn, slow_fn=None):
     """
-    Call fn(client) on whichever account is available, rotating on FloodWait.
-    fn receives the Pyrogram Client and should return the result.
-    Account 1 fetches from source; either account can send to destination.
+    Send using whichever account is available, rotating on FloodWait.
+    - If Account 1 (reader) is free: fast_fn(client) — uses file_id directly.
+    - If only Account 2 is free: slow_fn(client) — downloads via reader first.
+    - slow_fn=None means the same fn works for any account (e.g. text messages).
     """
     while True:
         acc = get_account()
         try:
-            return fn(acc["client"])
+            if slow_fn is None or acc["client"] is reader:
+                return fast_fn(acc["client"])
+            else:
+                return slow_fn(acc["client"])
         except FloodWait as e:
             acc["flood_until"] = time.time() + e.value
             other = next((a for a in accounts if a is not acc), None)
@@ -120,39 +124,34 @@ def send_single(reader, msg_id):
     """
     Fetch message from Account 1 (reader), then send its content to destination
     via whichever account is free. This way Account 2 never needs source access.
+    Account 1 sends using file_id (fast). Account 2 downloads via reader first (no MEDIA_EMPTY).
     """
     msg = reader.get_messages(source_channel, msg_id)
     media_type, file_id = _extract_media(msg)
     caption = msg.caption or msg.text or ""
     caption_entities = msg.caption_entities or msg.entities or None
 
-    result = send_with_retry(_make_single_sender(media_type, file_id, caption, caption_entities))
+    fast = _make_single_sender(media_type, file_id, caption, caption_entities)
 
-    # file_id is session-specific: if Account 2 used it, Telegram returns MEDIA_EMPTY.
-    # Fall back to downloading via reader and re-uploading as raw bytes.
-    if isinstance(result, Exception) and "MEDIA_EMPTY" in str(result) and media_type:
-        try:
-            data = reader.download_media(file_id, in_memory=True)
-            data.seek(0)
-            result = send_with_retry(_make_single_sender(media_type, data, caption, caption_entities))
-        except Exception as e:
-            result = e
+    if not media_type:
+        # Text-only: same fn works for any account
+        return send_with_retry(reader, fast)
 
-    return result
+    def slow(c):
+        data = reader.download_media(file_id, in_memory=True)
+        data.seek(0)
+        return _make_single_sender(media_type, data, caption, caption_entities)(c)
+
+    return send_with_retry(reader, fast, slow)
 
 
-def _build_album_media(msgs, use_bytes=False, reader=None):
-    """Build an InputMedia list from messages. If use_bytes, download via reader."""
+def _build_album_media(msgs, src_list):
+    """Build an InputMedia list from messages using pre-resolved sources (file_ids or BytesIO)."""
     media_list = []
-    for msg in msgs:
-        media_type, file_id = _extract_media(msg)
+    for msg, src in zip(msgs, src_list):
+        media_type, _ = _extract_media(msg)
         caption = msg.caption or ""
         caption_entities = msg.caption_entities or None
-        if use_bytes and reader and media_type:
-            src = reader.download_media(file_id, in_memory=True)
-            src.seek(0)
-        else:
-            src = file_id
         if media_type == "photo":
             media_list.append(InputMediaPhoto(src, caption=caption, caption_entities=caption_entities))
         elif media_type == "video":
@@ -168,25 +167,27 @@ def send_album(reader, first_msg_id):
     """
     Fetch a media group from Account 1 (reader), then send it as an album
     via whichever account is free.
+    Account 1 sends using file_ids (fast). Account 2 downloads via reader first (no MEDIA_EMPTY).
     """
     msgs = reader.get_media_group(source_channel, first_msg_id)
-    media_list = _build_album_media(msgs)
+    file_ids = [_extract_media(m)[1] for m in msgs]
 
-    if not media_list:
+    fast_media = _build_album_media(msgs, file_ids)
+    if not fast_media:
         return Exception("album had no supported media")
 
-    result = send_with_retry(lambda c: c.send_media_group(destination_channel, media_list))
+    def slow(c):
+        sources = []
+        for fid in file_ids:
+            data = reader.download_media(fid, in_memory=True)
+            data.seek(0)
+            sources.append(data)
+        slow_media = _build_album_media(msgs, sources)
+        if not slow_media:
+            raise Exception("album had no supported media after download")
+        return c.send_media_group(destination_channel, slow_media)
 
-    # file_ids are session-specific; fall back to downloading and re-uploading.
-    if isinstance(result, Exception) and "MEDIA_EMPTY" in str(result):
-        try:
-            media_list = _build_album_media(msgs, use_bytes=True, reader=reader)
-            if media_list:
-                result = send_with_retry(lambda c: c.send_media_group(destination_channel, media_list))
-        except Exception as e:
-            result = e
-
-    return result
+    return send_with_retry(reader, lambda c: c.send_media_group(destination_channel, fast_media), slow)
 
 
 def forward_old_messages(fresh=False, skip_count=0):
