@@ -19,6 +19,7 @@ destination_channel = int(os.environ["DESTINATION_CHANNEL"])
 
 PROGRESS_FILE = "progress.txt"      # stores last successfully cloned message ID
 INDEX_CACHE_FILE = "msg_index.json"  # cached list of (id, media_group_id) from source
+SKIPPED_FILE = "skipped.json"        # all failed messages with error details
 
 # Each account needs its own session file and phone number.
 # Only Account 1 needs access to the source channel.
@@ -76,6 +77,24 @@ def clear_index_cache():
         os.remove(INDEX_CACHE_FILE)
 
 
+def save_skipped(msg_ids, group_id, error):
+    """Append a skipped entry to skipped.json immediately."""
+    entry = {
+        "msg_ids": msg_ids,
+        "group_id": group_id,
+        "error": str(error),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    records = []
+    if os.path.exists(SKIPPED_FILE):
+        try:
+            records = json.loads(open(SKIPPED_FILE).read())
+        except Exception:
+            pass
+    records.append(entry)
+    open(SKIPPED_FILE, "w").write(json.dumps(records, indent=2))
+
+
 def get_account():
     """Return the account with the soonest available time, sleeping if both are limited."""
     now = time.time()
@@ -89,7 +108,7 @@ def get_account():
     return soonest
 
 
-def send_with_retry(reader, fast_fn, slow_fn=None, _attempts=2):
+def send_with_retry(reader, fast_fn, slow_fn=None, _attempts=3):
     """
     Send using whichever account is available, rotating on FloodWait.
     - If Account 1 (reader) is free: fast_fn(client) — uses file_id directly.
@@ -406,6 +425,7 @@ def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
                     result = send_album(reader, msg_ids[0])
                     if isinstance(result, Exception):
                         print(f"\n  [skip] album {group_id}: {result}")
+                        save_skipped(msg_ids, group_id, result)
                     else:
                         save_progress(max(msg_ids))
                     pbar.update(len(msg_ids))
@@ -413,6 +433,7 @@ def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
                     result = send_single(reader, msg_ids[0])
                     if isinstance(result, Exception):
                         print(f"\n  [skip] msg {msg_ids[0]}: {result}")
+                        save_skipped(msg_ids, None, result)
                     else:
                         save_progress(msg_ids[0])
                     pbar.update(1)
