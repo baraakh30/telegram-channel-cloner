@@ -124,7 +124,7 @@ def _media_filename(msg):
 
 
 def _make_single_sender(media_type, src, caption, caption_entities,
-                        width=None, height=None, duration=None, supports_streaming=None):
+                        width=None, height=None, duration=None, supports_streaming=None, thumb=None):
     """Return a lambda(client) that sends src to the destination channel."""
     if media_type == "photo":
         return lambda c: c.send_photo(destination_channel, src, caption=caption, caption_entities=caption_entities)
@@ -134,6 +134,7 @@ def _make_single_sender(media_type, src, caption, caption_entities,
             caption=caption, caption_entities=caption_entities,
             width=width, height=height, duration=duration,
             supports_streaming=supports_streaming,
+            thumb=thumb,
         )
     elif media_type == "document":
         return lambda c: c.send_document(destination_channel, src, caption=caption, caption_entities=caption_entities)
@@ -181,15 +182,23 @@ def send_single(reader, msg_id):
         data = reader.download_media(file_id, in_memory=True)
         data.seek(0)
         data.name = _media_filename(msg)
-        return _make_single_sender(media_type, data, caption, caption_entities, **video_kwargs)(c)
+        slow_vkw = dict(video_kwargs)
+        if media_type == "video" and msg.video and msg.video.thumbs:
+            td = reader.download_media(msg.video.thumbs[0].file_id, in_memory=True)
+            td.seek(0)
+            td.name = "thumb.jpg"
+            slow_vkw["thumb"] = td
+        return _make_single_sender(media_type, data, caption, caption_entities, **slow_vkw)(c)
 
     return send_with_retry(reader, fast, slow)
 
 
-def _build_album_media(msgs, src_list):
+def _build_album_media(msgs, src_list, thumbs=None):
     """Build an InputMedia list from messages using pre-resolved sources (file_ids or BytesIO)."""
+    if thumbs is None:
+        thumbs = [None] * len(msgs)
     media_list = []
-    for msg, src in zip(msgs, src_list):
+    for msg, src, thumb in zip(msgs, src_list, thumbs):
         media_type, _ = _extract_media(msg)
         caption = msg.caption or ""
         caption_entities = msg.caption_entities or None
@@ -203,6 +212,7 @@ def _build_album_media(msgs, src_list):
                 height=v.height if v else None,
                 duration=v.duration if v else None,
                 supports_streaming=v.supports_streaming if v else None,
+                thumb=thumb,
             ))
         elif media_type == "document":
             media_list.append(InputMediaDocument(src, caption=caption, caption_entities=caption_entities))
@@ -226,12 +236,20 @@ def send_album(reader, first_msg_id):
 
     def slow(c):
         sources = []
+        thumbs = []
         for m, fid in zip(msgs, file_ids):
             data = reader.download_media(fid, in_memory=True)
             data.seek(0)
             data.name = _media_filename(m)
             sources.append(data)
-        slow_media = _build_album_media(msgs, sources)
+            thumb = None
+            if m.video and m.video.thumbs:
+                td = reader.download_media(m.video.thumbs[0].file_id, in_memory=True)
+                td.seek(0)
+                td.name = "thumb.jpg"
+                thumb = td
+            thumbs.append(thumb)
+        slow_media = _build_album_media(msgs, sources, thumbs)
         if not slow_media:
             raise Exception("album had no supported media after download")
         return c.send_media_group(destination_channel, slow_media)
