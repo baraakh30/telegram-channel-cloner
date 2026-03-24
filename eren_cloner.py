@@ -178,6 +178,17 @@ def forward_old_messages(fresh=False, skip_count=0):
             print("Destination channel not found in your chats")
             return
 
+        # Resolve destination peer on every account so they can all send to it.
+        # Without this, accounts that haven't joined the channel via get_dialogs
+        # will get "Peer id invalid" when trying to send.
+        print("Resolving destination peer on all accounts...")
+        for acc in accounts:
+            try:
+                chat = acc["client"].get_chat(destination_channel)
+                print(f"  {acc['name']}: destination resolved ({chat.title})")
+            except Exception as e:
+                print(f"  {acc['name']}: WARNING — could not resolve destination: {e}")
+
         # Resume logic
         resume_after_id = None
         if fresh:
