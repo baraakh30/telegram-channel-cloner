@@ -50,8 +50,29 @@ def send_with_retry(func, *args, **kwargs):
 
 def forward_old_messages():
     with eren:
+        print("Finding channels...")
+        source_chat = None
+        dest_chat = None
+        
+        # Get all dialogs to find matching channels
+        for dialog in eren.get_dialogs():
+            chat_id = dialog.chat.id
+            if chat_id == source_channel or chat_id == int(os.environ.get("SOURCE_CHANNEL", "0")):
+                source_chat = dialog.chat
+                print(f"Found source: {dialog.chat.title} (ID: {chat_id})")
+            if chat_id == destination_channel or chat_id == int(os.environ.get("DESTINATION_CHANNEL", "0")):
+                dest_chat = dialog.chat
+                print(f"Found destination: {dialog.chat.title} (ID: {chat_id})")
+        
+        if not source_chat:
+            print("Source channel not found in your chats")
+            return
+        if not dest_chat:
+            print("Destination channel not found in your chats")
+            return
+        
         print("Fetching messages from source channel...")
-        messages = list(eren.get_chat_history(source_channel, limit=None))
+        messages = list(eren.get_chat_history(source_chat.id, limit=None))
         messages.reverse()  # oldest first
 
         total = len(messages)
