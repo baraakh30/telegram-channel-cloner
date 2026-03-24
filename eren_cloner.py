@@ -81,7 +81,7 @@ def send_with_retry(method_name, *args, **kwargs):
             return e
 
 
-def forward_old_messages(fresh=False):
+def forward_old_messages(fresh=False, skip_count=0):
     for acc in accounts:
         acc["client"].start()
 
@@ -113,11 +113,13 @@ def forward_old_messages(fresh=False):
         if fresh:
             clear_progress()
             print("Starting fresh.")
+        elif skip_count:
+            clear_progress()  # --skip takes precedence over saved progress
         else:
             saved = load_progress()
             if saved:
                 resume_after_id = saved
-                print(f"Resuming after message ID {resume_after_id}  (use --fresh to start over)")
+                print(f"Resuming after message ID {resume_after_id}  (use --fresh to start over, --skip N to override)")
 
         print("Fetching message list...")
         msg_index = []
@@ -147,10 +149,11 @@ def forward_old_messages(fresh=False):
                 grouped.append((None, [mid]))
                 i += 1
 
-        # Find where to resume: skip all groups whose last message ID <= resume_after_id
+        # Find where to resume
         start_index = 0
         skipped_msgs = 0
         if resume_after_id:
+            # Resume by message ID (from saved progress file)
             for idx, (gid, ids) in enumerate(grouped):
                 if max(ids) <= resume_after_id:
                     skipped_msgs += len(ids)
@@ -158,6 +161,15 @@ def forward_old_messages(fresh=False):
                 else:
                     break
             print(f"Skipping {skipped_msgs} already-cloned messages, continuing from group index {start_index}.")
+        elif skip_count:
+            # Resume by message count (manual --skip argument)
+            for idx, (gid, ids) in enumerate(grouped):
+                if skipped_msgs + len(ids) <= skip_count:
+                    skipped_msgs += len(ids)
+                    start_index = idx + 1
+                else:
+                    break
+            print(f"Skipping first {skipped_msgs} messages (--skip {skip_count}).")
 
         remaining = sum(len(ids) for _, ids in grouped[start_index:])
 
@@ -201,8 +213,9 @@ def forward_old_messages(fresh=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and start from the beginning")
+    parser.add_argument("--skip", type=int, default=0, metavar="N", help="Skip the first N messages (for manual resume)")
     args = parser.parse_args()
-    forward_old_messages(fresh=args.fresh)
+    forward_old_messages(fresh=args.fresh, skip_count=args.skip)
 
 
 # Author : Eren
