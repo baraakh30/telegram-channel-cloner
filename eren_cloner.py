@@ -27,12 +27,14 @@ SKIPPED_FILE = "skipped.json"        # all failed messages with error details
 accounts = [
     {
         "client": Client("session_1", api_id, api_hash, phone_number=os.environ["PHONE_NUMBER_1"]),
-        "flood_until": 0,  # epoch time when this account is free again
+        "flood_until": 0,           # epoch time when sending is free again
+        "download_flood_until": 0,  # epoch time when downloading (auth.ExportAuthorization) is free again
         "name": "Account 1",
     },
     {
         "client": Client("session_2", api_id, api_hash, phone_number=os.environ["PHONE_NUMBER_2"]),
         "flood_until": 0,
+        "download_flood_until": 0,
         "name": "Account 2",
     },
 ]
@@ -126,11 +128,13 @@ def send_with_retry(reader, fast_fn, slow_fn=None, _attempts=3):
         on_slow_path = slow_fn is not None and acc["client"] is not reader
 
         if on_slow_path:
-            # Slow path downloads via reader — if reader is still flood-waited
-            # (e.g. from a prior auth.ExportAuthorization limit), wait it out first.
-            wait = reader_acc["flood_until"] - time.time()
+            # Slow path downloads via reader — if reader's download is still
+            # rate-limited (auth.ExportAuthorization), wait it out first.
+            # Note: reader's send flood_until is tracked separately so a recovered
+            # send limit can still use the fast path independently.
+            wait = reader_acc["download_flood_until"] - time.time()
             if wait > 0:
-                print(f"\n  {reader_acc['name']} still limited ({wait:.0f}s), waiting before download...")
+                print(f"\n  {reader_acc['name']} download still limited ({wait:.0f}s), waiting...")
                 time.sleep(wait)
 
         try:
@@ -141,8 +145,10 @@ def send_with_retry(reader, fast_fn, slow_fn=None, _attempts=3):
         except FloodWait as e:
             if on_slow_path:
                 # FloodWait came from reader's download (e.g. auth.ExportAuthorization).
-                # Mark reader and retry — don't consume an attempt.
-                reader_acc["flood_until"] = time.time() + e.value
+                # Track separately so the send flood_until stays accurate — if the
+                # original send limit expires first, get_account() can return Account 1
+                # for a fast-path retry without waiting for the download limit too.
+                reader_acc["download_flood_until"] = time.time() + e.value
                 print(f"\n  {reader_acc['name']} rate limited for {e.value}s (download) — will retry after wait")
             else:
                 acc["flood_until"] = time.time() + e.value
