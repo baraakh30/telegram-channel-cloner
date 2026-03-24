@@ -3,6 +3,7 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 import time
 import os
+import json
 import mimetypes
 import argparse
 from dotenv import load_dotenv
@@ -16,7 +17,8 @@ api_hash = os.environ["API_HASH"]
 source_channel = int(os.environ["SOURCE_CHANNEL"])
 destination_channel = int(os.environ["DESTINATION_CHANNEL"])
 
-PROGRESS_FILE = "progress.txt"  # stores last successfully cloned message ID
+PROGRESS_FILE = "progress.txt"      # stores last successfully cloned message ID
+INDEX_CACHE_FILE = "msg_index.json"  # cached list of (id, media_group_id) from source
 
 # Each account needs its own session file and phone number.
 # Only Account 1 needs access to the source channel.
@@ -52,6 +54,26 @@ def save_progress(msg_id):
 def clear_progress():
     if os.path.exists(PROGRESS_FILE):
         os.remove(PROGRESS_FILE)
+
+
+def load_index_cache():
+    """Return cached [(id, media_group_id), ...] or None if no cache exists."""
+    if os.path.exists(INDEX_CACHE_FILE):
+        try:
+            data = json.loads(open(INDEX_CACHE_FILE).read())
+            return [tuple(item) for item in data]
+        except Exception:
+            pass
+    return None
+
+
+def save_index_cache(msg_index):
+    open(INDEX_CACHE_FILE, "w").write(json.dumps(msg_index))
+
+
+def clear_index_cache():
+    if os.path.exists(INDEX_CACHE_FILE):
+        os.remove(INDEX_CACHE_FILE)
 
 
 def get_account():
@@ -266,7 +288,7 @@ def send_album(reader, first_msg_id):
     return send_with_retry(reader, lambda c: c.send_media_group(destination_channel, fast_media), slow)
 
 
-def forward_old_messages(fresh=False, skip_count=0):
+def forward_old_messages(fresh=False, skip_count=0, refresh_index=False):
     for acc in accounts:
         acc["client"].start()
 
@@ -308,6 +330,7 @@ def forward_old_messages(fresh=False, skip_count=0):
         resume_after_id = None
         if fresh:
             clear_progress()
+            clear_index_cache()
             print("Starting fresh.")
         elif skip_count:
             clear_progress()  # --skip takes precedence over saved progress
@@ -317,14 +340,24 @@ def forward_old_messages(fresh=False, skip_count=0):
                 resume_after_id = saved
                 print(f"Resuming after message ID {resume_after_id}  (use --fresh to start over, --skip N to override)")
 
-        print("Fetching message list...")
-        msg_index = []
-        for msg in reader.get_chat_history(source_channel):
-            if msg.service:
-                continue
-            msg_index.append((msg.id, msg.media_group_id))
+        if refresh_index:
+            clear_index_cache()
 
-        msg_index.reverse()  # oldest first
+        cached = load_index_cache()
+        if cached:
+            msg_index = cached
+            print(f"Loaded message index from cache ({len(msg_index)} messages). Use --refresh-index to re-fetch.")
+        else:
+            print("Fetching message index from Telegram...")
+            msg_index = []
+            for msg in reader.get_chat_history(source_channel):
+                if msg.service:
+                    continue
+                msg_index.append((msg.id, msg.media_group_id))
+            msg_index.reverse()  # oldest first
+            save_index_cache(msg_index)
+            print(f"Fetched and cached {len(msg_index)} messages.")
+
         total = len(msg_index)
         print(f"Total messages: {total}")
 
@@ -398,8 +431,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and start from the beginning")
     parser.add_argument("--skip", type=int, default=0, metavar="N", help="Skip the first N messages (for manual resume)")
+    parser.add_argument("--refresh-index", action="store_true", help="Re-fetch the message index from Telegram (discards msg_index.json cache)")
     args = parser.parse_args()
-    forward_old_messages(fresh=args.fresh, skip_count=args.skip)
+    forward_old_messages(fresh=args.fresh, skip_count=args.skip, refresh_index=args.refresh_index)
 
 
 # Author : Eren
