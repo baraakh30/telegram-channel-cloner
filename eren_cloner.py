@@ -67,14 +67,17 @@ def get_account():
     return soonest
 
 
-def send_with_retry(reader, fast_fn, slow_fn=None):
+def send_with_retry(reader, fast_fn, slow_fn=None, _attempts=2):
     """
     Send using whichever account is available, rotating on FloodWait.
     - If Account 1 (reader) is free: fast_fn(client) — uses file_id directly.
     - If only Account 2 is free: slow_fn(client) — downloads via reader first.
     - slow_fn=None means the same fn works for any account (e.g. text messages).
+    - Non-FloodWait errors are retried up to _attempts times before skipping.
     """
-    while True:
+    last_exc = None
+    remaining = _attempts
+    while remaining > 0:
         acc = get_account()
         try:
             if slow_fn is None or acc["client"] is reader:
@@ -86,8 +89,14 @@ def send_with_retry(reader, fast_fn, slow_fn=None):
             other = next((a for a in accounts if a is not acc), None)
             status = f"switching to {other['name']}" if other and other["flood_until"] <= time.time() else f"waiting {e.value}s"
             print(f"\n  {acc['name']} rate limited for {e.value}s — {status}")
+            # FloodWait doesn't consume an attempt
         except Exception as e:
-            return e
+            last_exc = e
+            remaining -= 1
+            if remaining > 0:
+                print(f"\n  Send failed ({e}), retrying in 3s...")
+                time.sleep(3)
+    return last_exc
 
 
 def _extract_media(msg):
