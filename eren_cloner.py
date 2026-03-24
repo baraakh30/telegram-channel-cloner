@@ -3,6 +3,7 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 import time
 import os
+import mimetypes
 import argparse
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -98,6 +99,30 @@ def _extract_media(msg):
     return None, None
 
 
+_MIME_EXT_FIXES = {".jpe": ".jpg", ".jpeg": ".jpg"}
+
+def _media_filename(msg):
+    """
+    Return a filename (with extension) for the message's media.
+    Pyrogram uses the BytesIO .name attribute to set the MIME type on upload —
+    without it Telegram receives the file as application/octet-stream and may
+    re-process or reject it.
+    """
+    for attr in ("document", "video", "audio", "animation", "voice", "sticker", "video_note"):
+        media = getattr(msg, attr, None)
+        if media:
+            if getattr(media, "file_name", None):
+                return media.file_name
+            mime = getattr(media, "mime_type", None)
+            if mime:
+                ext = mimetypes.guess_extension(mime) or ""
+                ext = _MIME_EXT_FIXES.get(ext, ext)
+                return f"file{ext}"
+    if getattr(msg, "photo", None):
+        return "photo.jpg"
+    return "file"
+
+
 def _make_single_sender(media_type, src, caption, caption_entities):
     """Return a lambda(client) that sends src to the destination channel."""
     if media_type == "photo":
@@ -140,6 +165,7 @@ def send_single(reader, msg_id):
     def slow(c):
         data = reader.download_media(file_id, in_memory=True)
         data.seek(0)
+        data.name = _media_filename(msg)
         return _make_single_sender(media_type, data, caption, caption_entities)(c)
 
     return send_with_retry(reader, fast, slow)
@@ -178,9 +204,10 @@ def send_album(reader, first_msg_id):
 
     def slow(c):
         sources = []
-        for fid in file_ids:
+        for m, fid in zip(msgs, file_ids):
             data = reader.download_media(fid, in_memory=True)
             data.seek(0)
+            data.name = _media_filename(m)
             sources.append(data)
         slow_media = _build_album_media(msgs, sources)
         if not slow_media:
