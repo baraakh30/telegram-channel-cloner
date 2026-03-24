@@ -123,12 +123,18 @@ def _media_filename(msg):
     return "file"
 
 
-def _make_single_sender(media_type, src, caption, caption_entities):
+def _make_single_sender(media_type, src, caption, caption_entities,
+                        width=None, height=None, duration=None, supports_streaming=None):
     """Return a lambda(client) that sends src to the destination channel."""
     if media_type == "photo":
         return lambda c: c.send_photo(destination_channel, src, caption=caption, caption_entities=caption_entities)
     elif media_type == "video":
-        return lambda c: c.send_video(destination_channel, src, caption=caption, caption_entities=caption_entities)
+        return lambda c: c.send_video(
+            destination_channel, src,
+            caption=caption, caption_entities=caption_entities,
+            width=width, height=height, duration=duration,
+            supports_streaming=supports_streaming,
+        )
     elif media_type == "document":
         return lambda c: c.send_document(destination_channel, src, caption=caption, caption_entities=caption_entities)
     elif media_type == "audio":
@@ -156,7 +162,16 @@ def send_single(reader, msg_id):
     caption = msg.caption or msg.text or ""
     caption_entities = msg.caption_entities or msg.entities or None
 
-    fast = _make_single_sender(media_type, file_id, caption, caption_entities)
+    video_kwargs = {}
+    if media_type == "video" and msg.video:
+        video_kwargs = dict(
+            width=msg.video.width,
+            height=msg.video.height,
+            duration=msg.video.duration,
+            supports_streaming=msg.video.supports_streaming,
+        )
+
+    fast = _make_single_sender(media_type, file_id, caption, caption_entities, **video_kwargs)
 
     if not media_type:
         # Text-only: same fn works for any account
@@ -166,7 +181,7 @@ def send_single(reader, msg_id):
         data = reader.download_media(file_id, in_memory=True)
         data.seek(0)
         data.name = _media_filename(msg)
-        return _make_single_sender(media_type, data, caption, caption_entities)(c)
+        return _make_single_sender(media_type, data, caption, caption_entities, **video_kwargs)(c)
 
     return send_with_retry(reader, fast, slow)
 
@@ -181,7 +196,14 @@ def _build_album_media(msgs, src_list):
         if media_type == "photo":
             media_list.append(InputMediaPhoto(src, caption=caption, caption_entities=caption_entities))
         elif media_type == "video":
-            media_list.append(InputMediaVideo(src, caption=caption, caption_entities=caption_entities))
+            v = msg.video
+            media_list.append(InputMediaVideo(
+                src, caption=caption, caption_entities=caption_entities,
+                width=v.width if v else None,
+                height=v.height if v else None,
+                duration=v.duration if v else None,
+                supports_streaming=v.supports_streaming if v else None,
+            ))
         elif media_type == "document":
             media_list.append(InputMediaDocument(src, caption=caption, caption_entities=caption_entities))
         elif media_type == "audio":
