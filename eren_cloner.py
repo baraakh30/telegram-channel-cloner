@@ -21,10 +21,24 @@ destination_channel = int(os.environ["DESTINATION_CHANNEL"])
 eren = Client("user_session", api_id, api_hash, phone_number=phone_number)
 
 
+def build_input_media(message):
+    """Build InputMedia from a (freshly fetched) message using its file_id."""
+    caption = message.caption or ""
+    entities = message.caption_entities
+
+    if message.photo:
+        return InputMediaPhoto(message.photo.file_id, caption=caption, caption_entities=entities)
+    elif message.video:
+        return InputMediaVideo(message.video.file_id, caption=caption, caption_entities=entities)
+    elif message.document:
+        return InputMediaDocument(message.document.file_id, caption=caption, caption_entities=entities)
+    elif message.audio:
+        return InputMediaAudio(message.audio.file_id, caption=caption, caption_entities=entities)
+    return None
+
+
 def download_and_build_input_media(client, message, temp_dir):
-    """Download media to disk and return an InputMedia with a local file path.
-    Using a local path avoids FILE_REFERENCE_EXPIRED errors that occur when
-    passing file_id references that were fetched earlier and have since expired."""
+    """Fallback: download to disk when file references are still expired after a re-fetch."""
     caption = message.caption or ""
     entities = message.caption_entities
 
@@ -136,27 +150,42 @@ def forward_old_messages():
             with tqdm(total=total, desc="Cloning", unit="msg") as pbar:
                 for group_id, group_msgs in grouped:
                     if group_id:
-                        # Download every file in the album before sending to
-                        # avoid FILE_REFERENCE_EXPIRED on send_media_group
-                        media_list = []
-                        local_paths = []
-                        for m in group_msgs:
-                            item = download_and_build_input_media(eren, m, temp_dir)
-                            if item:
-                                media_list.append(item)
-                                local_paths.append(item.media)
+                        msg_ids = [m.id for m in group_msgs]
+
+                        # Re-fetch the messages to get fresh file references —
+                        # the ones from get_chat_history may have expired by now.
+                        # This is a fast API call (no file transfer) and fixes
+                        # FILE_REFERENCE_EXPIRED without downloading anything.
+                        fresh_msgs = eren.get_messages(source_channel, msg_ids)
+                        if not isinstance(fresh_msgs, list):
+                            fresh_msgs = [fresh_msgs]
+
+                        media_list = [build_input_media(m) for m in fresh_msgs]
+                        media_list = [m for m in media_list if m is not None]
 
                         if media_list:
                             result = send_with_retry(eren.send_media_group, destination_channel, media_list)
                             if isinstance(result, Exception):
-                                print(f"\n  [skip] album {group_id}: {result}")
-
-                        # Clean up downloaded files
-                        for path in local_paths:
-                            try:
-                                os.remove(path)
-                            except Exception:
-                                pass
+                                # References still expired — last resort: download and re-upload
+                                if "FILE_REFERENCE" in str(result):
+                                    media_list = []
+                                    local_paths = []
+                                    for m in fresh_msgs:
+                                        item = download_and_build_input_media(eren, m, temp_dir)
+                                        if item:
+                                            media_list.append(item)
+                                            local_paths.append(item.media)
+                                    if media_list:
+                                        result2 = send_with_retry(eren.send_media_group, destination_channel, media_list)
+                                        if isinstance(result2, Exception):
+                                            print(f"\n  [skip] album {group_id}: {result2}")
+                                    for path in local_paths:
+                                        try:
+                                            os.remove(path)
+                                        except Exception:
+                                            pass
+                                else:
+                                    print(f"\n  [skip] album {group_id}: {result}")
 
                         pbar.update(len(group_msgs))
                     else:
