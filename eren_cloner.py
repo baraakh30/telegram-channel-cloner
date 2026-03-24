@@ -1,5 +1,6 @@
 from pyrogram import Client
 from pyrogram.errors import FloodWait
+from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 import time
 import os
 import argparse
@@ -17,7 +18,7 @@ destination_channel = int(os.environ["DESTINATION_CHANNEL"])
 PROGRESS_FILE = "progress.txt"  # stores last successfully cloned message ID
 
 # Each account needs its own session file and phone number.
-# Add PHONE_NUMBER_2 to .env for the second account.
+# Only Account 1 needs access to the source channel.
 # Both accounts must be admins of the destination channel.
 accounts = [
     {
@@ -65,13 +66,16 @@ def get_account():
     return soonest
 
 
-def send_with_retry(method_name, *args, **kwargs):
-    """Call method_name on whichever account is available, rotating on FloodWait."""
+def send_with_retry(fn):
+    """
+    Call fn(client) on whichever account is available, rotating on FloodWait.
+    fn receives the Pyrogram Client and should return the result.
+    Account 1 fetches from source; either account can send to destination.
+    """
     while True:
         acc = get_account()
-        method = getattr(acc["client"], method_name)
         try:
-            return method(*args, **kwargs)
+            return fn(acc["client"])
         except FloodWait as e:
             acc["flood_until"] = time.time() + e.value
             other = next((a for a in accounts if a is not acc), None)
@@ -81,12 +85,78 @@ def send_with_retry(method_name, *args, **kwargs):
             return e
 
 
+def _extract_media(msg):
+    """Return (media_type_str, file_id) or (None, None) for text-only messages."""
+    for attr in ("photo", "video", "document", "audio", "animation", "voice", "sticker", "video_note"):
+        media = getattr(msg, attr, None)
+        if media:
+            return attr, media.file_id
+    return None, None
+
+
+def send_single(reader, msg_id):
+    """
+    Fetch message from Account 1 (reader), then send its content to destination
+    via whichever account is free. This way Account 2 never needs source access.
+    """
+    msg = reader.get_messages(source_channel, msg_id)
+    media_type, file_id = _extract_media(msg)
+    caption = msg.caption or msg.text or ""
+    caption_entities = msg.caption_entities or msg.entities or None
+
+    if media_type == "photo":
+        return send_with_retry(lambda c: c.send_photo(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
+    elif media_type == "video":
+        return send_with_retry(lambda c: c.send_video(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
+    elif media_type == "document":
+        return send_with_retry(lambda c: c.send_document(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
+    elif media_type == "audio":
+        return send_with_retry(lambda c: c.send_audio(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
+    elif media_type == "animation":
+        return send_with_retry(lambda c: c.send_animation(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
+    elif media_type == "voice":
+        return send_with_retry(lambda c: c.send_voice(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
+    elif media_type == "sticker":
+        return send_with_retry(lambda c: c.send_sticker(destination_channel, file_id))
+    elif media_type == "video_note":
+        return send_with_retry(lambda c: c.send_video_note(destination_channel, file_id))
+    else:
+        # Text-only
+        return send_with_retry(lambda c: c.send_message(destination_channel, caption, entities=caption_entities))
+
+
+def send_album(reader, first_msg_id):
+    """
+    Fetch a media group from Account 1 (reader), then send it as an album
+    via whichever account is free.
+    """
+    msgs = reader.get_media_group(source_channel, first_msg_id)
+    media_list = []
+    for msg in msgs:
+        media_type, file_id = _extract_media(msg)
+        caption = msg.caption or ""
+        caption_entities = msg.caption_entities or None
+        if media_type == "photo":
+            media_list.append(InputMediaPhoto(file_id, caption=caption, caption_entities=caption_entities))
+        elif media_type == "video":
+            media_list.append(InputMediaVideo(file_id, caption=caption, caption_entities=caption_entities))
+        elif media_type == "document":
+            media_list.append(InputMediaDocument(file_id, caption=caption, caption_entities=caption_entities))
+        elif media_type == "audio":
+            media_list.append(InputMediaAudio(file_id, caption=caption, caption_entities=caption_entities))
+
+    if not media_list:
+        return Exception("album had no supported media")
+
+    return send_with_retry(lambda c: c.send_media_group(destination_channel, media_list))
+
+
 def forward_old_messages(fresh=False, skip_count=0):
     for acc in accounts:
         acc["client"].start()
 
     try:
-        reader = accounts[0]["client"]
+        reader = accounts[0]["client"]  # only Account 1 can read the source
 
         print("Finding channels...")
         source_found = dest_found = False
@@ -171,29 +241,17 @@ def forward_old_messages(fresh=False, skip_count=0):
                     break
             print(f"Skipping first {skipped_msgs} messages (--skip {skip_count}).")
 
-        remaining = sum(len(ids) for _, ids in grouped[start_index:])
-
         with tqdm(total=total, initial=skipped_msgs, desc="Cloning", unit="msg") as pbar:
             for group_id, msg_ids in grouped[start_index:]:
                 if group_id:
-                    result = send_with_retry(
-                        "copy_media_group",
-                        destination_channel,
-                        source_channel,
-                        msg_ids[0],
-                    )
+                    result = send_album(reader, msg_ids[0])
                     if isinstance(result, Exception):
                         print(f"\n  [skip] album {group_id}: {result}")
                     else:
                         save_progress(max(msg_ids))
                     pbar.update(len(msg_ids))
                 else:
-                    result = send_with_retry(
-                        "copy_message",
-                        destination_channel,
-                        source_channel,
-                        msg_ids[0],
-                    )
+                    result = send_single(reader, msg_ids[0])
                     if isinstance(result, Exception):
                         print(f"\n  [skip] msg {msg_ids[0]}: {result}")
                     else:
