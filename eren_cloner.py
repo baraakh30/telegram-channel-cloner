@@ -115,22 +115,41 @@ def send_with_retry(reader, fast_fn, slow_fn=None, _attempts=3):
     - If only Account 2 is free: slow_fn(client) — downloads via reader first.
     - slow_fn=None means the same fn works for any account (e.g. text messages).
     - Non-FloodWait errors are retried up to _attempts times before skipping.
+    - FloodWait from inside the slow path (e.g. auth.ExportAuthorization) is
+      handled by marking Account 1 and retrying without consuming an attempt.
     """
+    reader_acc = next(a for a in accounts if a["client"] is reader)
     last_exc = None
     remaining = _attempts
     while remaining > 0:
         acc = get_account()
+        on_slow_path = slow_fn is not None and acc["client"] is not reader
+
+        if on_slow_path:
+            # Slow path downloads via reader — if reader is still flood-waited
+            # (e.g. from a prior auth.ExportAuthorization limit), wait it out first.
+            wait = reader_acc["flood_until"] - time.time()
+            if wait > 0:
+                print(f"\n  {reader_acc['name']} still limited ({wait:.0f}s), waiting before download...")
+                time.sleep(wait)
+
         try:
-            if slow_fn is None or acc["client"] is reader:
+            if not on_slow_path:
                 return fast_fn(acc["client"])
             else:
                 return slow_fn(acc["client"])
         except FloodWait as e:
-            acc["flood_until"] = time.time() + e.value
-            other = next((a for a in accounts if a is not acc), None)
-            status = f"switching to {other['name']}" if other and other["flood_until"] <= time.time() else f"waiting {e.value}s"
-            print(f"\n  {acc['name']} rate limited for {e.value}s — {status}")
-            # FloodWait doesn't consume an attempt
+            if on_slow_path:
+                # FloodWait came from reader's download (e.g. auth.ExportAuthorization).
+                # Mark reader and retry — don't consume an attempt.
+                reader_acc["flood_until"] = time.time() + e.value
+                print(f"\n  {reader_acc['name']} rate limited for {e.value}s (download) — will retry after wait")
+            else:
+                acc["flood_until"] = time.time() + e.value
+                other = next((a for a in accounts if a is not acc), None)
+                status = f"switching to {other['name']}" if other and other["flood_until"] <= time.time() else f"waiting {e.value}s"
+                print(f"\n  {acc['name']} rate limited for {e.value}s — {status}")
+            # FloodWait never consumes an attempt
         except Exception as e:
             last_exc = e
             remaining -= 1
