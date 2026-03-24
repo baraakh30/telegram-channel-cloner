@@ -17,12 +17,24 @@ destination_channel = int(os.environ["DESTINATION_CHANNEL"])
 eren = Client("user_session", api_id, api_hash, phone_number=phone_number)
 
 
+# Adaptive delay: starts at MIN_DELAY, backs off on flood waits, recovers over time.
+MIN_DELAY = 1.5   # seconds between sends (safe baseline for single-channel bulk copy)
+MAX_DELAY = 6.0
+_delay = MIN_DELAY
+
+
 def send_with_retry(func, *args, **kwargs):
+    global _delay
     while True:
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            # Slowly recover toward minimum delay after a successful send
+            _delay = max(MIN_DELAY, _delay * 0.95)
+            return result
         except FloodWait as e:
-            print(f"\n  Rate limited. Waiting {e.value}s...")
+            # Back off: increase delay, then honor the full wait Telegram asked for
+            _delay = min(MAX_DELAY, _delay * 1.5)
+            print(f"\n  Rate limited — waiting {e.value}s (send delay now {_delay:.1f}s)...")
             time.sleep(e.value)
         except Exception as e:
             return e
@@ -105,7 +117,7 @@ def forward_old_messages():
                         print(f"\n  [skip] msg {msg_ids[0]}: {result}")
                     pbar.update(1)
 
-                time.sleep(0.3)
+                time.sleep(_delay)
 
 
 if __name__ == "__main__":
