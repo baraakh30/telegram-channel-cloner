@@ -94,6 +94,28 @@ def _extract_media(msg):
     return None, None
 
 
+def _make_single_sender(media_type, src, caption, caption_entities):
+    """Return a lambda(client) that sends src to the destination channel."""
+    if media_type == "photo":
+        return lambda c: c.send_photo(destination_channel, src, caption=caption, caption_entities=caption_entities)
+    elif media_type == "video":
+        return lambda c: c.send_video(destination_channel, src, caption=caption, caption_entities=caption_entities)
+    elif media_type == "document":
+        return lambda c: c.send_document(destination_channel, src, caption=caption, caption_entities=caption_entities)
+    elif media_type == "audio":
+        return lambda c: c.send_audio(destination_channel, src, caption=caption, caption_entities=caption_entities)
+    elif media_type == "animation":
+        return lambda c: c.send_animation(destination_channel, src, caption=caption, caption_entities=caption_entities)
+    elif media_type == "voice":
+        return lambda c: c.send_voice(destination_channel, src, caption=caption, caption_entities=caption_entities)
+    elif media_type == "sticker":
+        return lambda c: c.send_sticker(destination_channel, src)
+    elif media_type == "video_note":
+        return lambda c: c.send_video_note(destination_channel, src)
+    else:
+        return lambda c: c.send_message(destination_channel, caption, entities=caption_entities)
+
+
 def send_single(reader, msg_id):
     """
     Fetch message from Account 1 (reader), then send its content to destination
@@ -104,25 +126,42 @@ def send_single(reader, msg_id):
     caption = msg.caption or msg.text or ""
     caption_entities = msg.caption_entities or msg.entities or None
 
-    if media_type == "photo":
-        return send_with_retry(lambda c: c.send_photo(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
-    elif media_type == "video":
-        return send_with_retry(lambda c: c.send_video(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
-    elif media_type == "document":
-        return send_with_retry(lambda c: c.send_document(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
-    elif media_type == "audio":
-        return send_with_retry(lambda c: c.send_audio(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
-    elif media_type == "animation":
-        return send_with_retry(lambda c: c.send_animation(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
-    elif media_type == "voice":
-        return send_with_retry(lambda c: c.send_voice(destination_channel, file_id, caption=caption, caption_entities=caption_entities))
-    elif media_type == "sticker":
-        return send_with_retry(lambda c: c.send_sticker(destination_channel, file_id))
-    elif media_type == "video_note":
-        return send_with_retry(lambda c: c.send_video_note(destination_channel, file_id))
-    else:
-        # Text-only
-        return send_with_retry(lambda c: c.send_message(destination_channel, caption, entities=caption_entities))
+    result = send_with_retry(_make_single_sender(media_type, file_id, caption, caption_entities))
+
+    # file_id is session-specific: if Account 2 used it, Telegram returns MEDIA_EMPTY.
+    # Fall back to downloading via reader and re-uploading as raw bytes.
+    if isinstance(result, Exception) and "MEDIA_EMPTY" in str(result) and media_type:
+        try:
+            data = reader.download_media(file_id, in_memory=True)
+            data.seek(0)
+            result = send_with_retry(_make_single_sender(media_type, data, caption, caption_entities))
+        except Exception as e:
+            result = e
+
+    return result
+
+
+def _build_album_media(msgs, use_bytes=False, reader=None):
+    """Build an InputMedia list from messages. If use_bytes, download via reader."""
+    media_list = []
+    for msg in msgs:
+        media_type, file_id = _extract_media(msg)
+        caption = msg.caption or ""
+        caption_entities = msg.caption_entities or None
+        if use_bytes and reader and media_type:
+            src = reader.download_media(file_id, in_memory=True)
+            src.seek(0)
+        else:
+            src = file_id
+        if media_type == "photo":
+            media_list.append(InputMediaPhoto(src, caption=caption, caption_entities=caption_entities))
+        elif media_type == "video":
+            media_list.append(InputMediaVideo(src, caption=caption, caption_entities=caption_entities))
+        elif media_type == "document":
+            media_list.append(InputMediaDocument(src, caption=caption, caption_entities=caption_entities))
+        elif media_type == "audio":
+            media_list.append(InputMediaAudio(src, caption=caption, caption_entities=caption_entities))
+    return media_list
 
 
 def send_album(reader, first_msg_id):
@@ -131,24 +170,23 @@ def send_album(reader, first_msg_id):
     via whichever account is free.
     """
     msgs = reader.get_media_group(source_channel, first_msg_id)
-    media_list = []
-    for msg in msgs:
-        media_type, file_id = _extract_media(msg)
-        caption = msg.caption or ""
-        caption_entities = msg.caption_entities or None
-        if media_type == "photo":
-            media_list.append(InputMediaPhoto(file_id, caption=caption, caption_entities=caption_entities))
-        elif media_type == "video":
-            media_list.append(InputMediaVideo(file_id, caption=caption, caption_entities=caption_entities))
-        elif media_type == "document":
-            media_list.append(InputMediaDocument(file_id, caption=caption, caption_entities=caption_entities))
-        elif media_type == "audio":
-            media_list.append(InputMediaAudio(file_id, caption=caption, caption_entities=caption_entities))
+    media_list = _build_album_media(msgs)
 
     if not media_list:
         return Exception("album had no supported media")
 
-    return send_with_retry(lambda c: c.send_media_group(destination_channel, media_list))
+    result = send_with_retry(lambda c: c.send_media_group(destination_channel, media_list))
+
+    # file_ids are session-specific; fall back to downloading and re-uploading.
+    if isinstance(result, Exception) and "MEDIA_EMPTY" in str(result):
+        try:
+            media_list = _build_album_media(msgs, use_bytes=True, reader=reader)
+            if media_list:
+                result = send_with_retry(lambda c: c.send_media_group(destination_channel, media_list))
+        except Exception as e:
+            result = e
+
+    return result
 
 
 def forward_old_messages(fresh=False, skip_count=0):
