@@ -2,6 +2,7 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 import time
 import os
+import argparse
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -12,6 +13,8 @@ api_hash = os.environ["API_HASH"]
 
 source_channel = int(os.environ["SOURCE_CHANNEL"])
 destination_channel = int(os.environ["DESTINATION_CHANNEL"])
+
+PROGRESS_FILE = "progress.txt"  # stores last successfully cloned message ID
 
 # Each account needs its own session file and phone number.
 # Add PHONE_NUMBER_2 to .env for the second account.
@@ -30,13 +33,31 @@ accounts = [
 ]
 
 
+def load_progress():
+    """Return the last successfully cloned message ID, or None if no progress saved."""
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            return int(open(PROGRESS_FILE).read().strip())
+        except Exception:
+            pass
+    return None
+
+
+def save_progress(msg_id):
+    open(PROGRESS_FILE, "w").write(str(msg_id))
+
+
+def clear_progress():
+    if os.path.exists(PROGRESS_FILE):
+        os.remove(PROGRESS_FILE)
+
+
 def get_account():
     """Return the account with the soonest available time, sleeping if both are limited."""
     now = time.time()
     free = [a for a in accounts if a["flood_until"] <= now]
     if free:
         return free[0]
-    # Both limited — sleep until the one with the shortest wait recovers
     soonest = min(accounts, key=lambda a: a["flood_until"])
     wait = soonest["flood_until"] - now
     print(f"\n  Both accounts rate limited. Waiting {wait:.0f}s for {soonest['name']}...")
@@ -60,13 +81,11 @@ def send_with_retry(method_name, *args, **kwargs):
             return e
 
 
-def forward_old_messages():
-    # Start all sessions (triggers auth flow for new sessions)
+def forward_old_messages(fresh=False):
     for acc in accounts:
         acc["client"].start()
 
     try:
-        # Use first account to fetch message list (read-only, no rate limit risk)
         reader = accounts[0]["client"]
 
         print("Finding channels...")
@@ -89,7 +108,17 @@ def forward_old_messages():
             print("Destination channel not found in your chats")
             return
 
-        # Collect only (id, media_group_id) — no heavy message objects kept in memory
+        # Resume logic
+        resume_after_id = None
+        if fresh:
+            clear_progress()
+            print("Starting fresh.")
+        else:
+            saved = load_progress()
+            if saved:
+                resume_after_id = saved
+                print(f"Resuming after message ID {resume_after_id}  (use --fresh to start over)")
+
         print("Fetching message list...")
         msg_index = []
         for msg in reader.get_chat_history(source_channel):
@@ -99,7 +128,7 @@ def forward_old_messages():
 
         msg_index.reverse()  # oldest first
         total = len(msg_index)
-        print(f"Total messages to clone: {total}")
+        print(f"Total messages: {total}")
 
         # Group consecutive messages that share a media_group_id
         grouped = []
@@ -118,8 +147,22 @@ def forward_old_messages():
                 grouped.append((None, [mid]))
                 i += 1
 
-        with tqdm(total=total, desc="Cloning", unit="msg") as pbar:
-            for group_id, msg_ids in grouped:
+        # Find where to resume: skip all groups whose last message ID <= resume_after_id
+        start_index = 0
+        skipped_msgs = 0
+        if resume_after_id:
+            for idx, (gid, ids) in enumerate(grouped):
+                if max(ids) <= resume_after_id:
+                    skipped_msgs += len(ids)
+                    start_index = idx + 1
+                else:
+                    break
+            print(f"Skipping {skipped_msgs} already-cloned messages, continuing from group index {start_index}.")
+
+        remaining = sum(len(ids) for _, ids in grouped[start_index:])
+
+        with tqdm(total=total, initial=skipped_msgs, desc="Cloning", unit="msg") as pbar:
+            for group_id, msg_ids in grouped[start_index:]:
                 if group_id:
                     result = send_with_retry(
                         "copy_media_group",
@@ -129,6 +172,8 @@ def forward_old_messages():
                     )
                     if isinstance(result, Exception):
                         print(f"\n  [skip] album {group_id}: {result}")
+                    else:
+                        save_progress(max(msg_ids))
                     pbar.update(len(msg_ids))
                 else:
                     result = send_with_retry(
@@ -139,9 +184,14 @@ def forward_old_messages():
                     )
                     if isinstance(result, Exception):
                         print(f"\n  [skip] msg {msg_ids[0]}: {result}")
+                    else:
+                        save_progress(msg_ids[0])
                     pbar.update(1)
 
                 time.sleep(0.3)
+
+        clear_progress()
+        print("Done! All messages cloned.")
 
     finally:
         for acc in accounts:
@@ -149,7 +199,10 @@ def forward_old_messages():
 
 
 if __name__ == "__main__":
-    forward_old_messages()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and start from the beginning")
+    args = parser.parse_args()
+    forward_old_messages(fresh=args.fresh)
 
 
 # Author : Eren
